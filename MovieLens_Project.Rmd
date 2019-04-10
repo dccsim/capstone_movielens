@@ -1,0 +1,605 @@
+---
+title: "MovieLens Project"
+author: "Dennis Sim"
+date: "March 1, 2019"
+output: 
+  pdf_document:
+    fig_width: 6
+    fig_height: 3.5
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### 1 Introduction
+
+#### 1.1 Data set
+
+This project uses the [MovieLens](http://www.movielens.org) data set that contains 10,000,054 ratings and 95,580 tags applied to 10,681 movies by 71,567 users of the online movie recommender service.  Each randomly selected user is associated with an id and have rated at least 20 movies.  More information about this data set is described in MovieLens 10M/100k Data Set [README](http://files.grouplens.org/datasets/movielens/ml-10m-README.html).
+
+#### 1.2 Project goal summary
+
+The project aims to help users look for movie recommendations by making use of this data set to predict the rating of a movie by a given user based on ratings of similar movies and user groups.
+
+#### 1.3 Key steps performed
+
+The data set is first partitioned into edx and validation data sets using codes provided in the project instructions with some modifications to extract movie release year from the movie title and install/load additional libraries. 
+
+```{r load_data, echo=FALSE, message=FALSE, warning=FALSE}
+#############################################################
+# Create edx set, validation set, and submission file
+#############################################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+# set data source
+#
+# 1: local PC folder (c:/apps/data/r/ml)
+# 2: local mac folder (~/Desktop/movielen)
+# others: download
+# 
+# if using local data source: 
+# - place movies.dat and ratings.dat in subfolder "ml-10M100K" of the PC/mac folders above
+data_source <- 0
+
+if (data_source == 1) {
+  setwd("c:/apps/data/r/ml")
+} else if (data_source == 2) {
+  setwd("~/Codes/movielens")
+} else {
+  dl <- tempfile()
+  download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+}
+
+if (data_source %in% c(1,2)) {
+  movies <- str_split_fixed(readLines("ml-10M100K/movies.dat", encoding = "UTF-8"), "\\::", 3)
+} else {
+  movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+} 
+
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+# Replaced read.table() with fread() for faster data loading
+#
+# ratings <- read.table(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+#                     col.names = c("userId", "movieId", "rating", "timestamp"))
+
+if (data_source %in% c(1,2)) {
+  ratings <- fread(text = gsub("::", "\t", readLines("ml-10M100K/ratings.dat")),
+                   col.names = c("userId", "movieId", "rating", "timestamp"))
+} else {
+  ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                col.names = c("userId", "movieId", "rating", "timestamp"))
+} 
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Extract more information
+
+# Movie Year: extract movie release year
+
+# a feature of gsub it returns the input string if there are no matches to the supplied pattern
+# matches returns the entire string, thus this modified gsub() to return empty na if that's the case
+my_gsub <- function(pattern, replacement, x) {
+  ans <- ifelse(grepl(pattern=pattern, x=x), 
+                gsub(pattern=pattern, replacement=replacement, x=x), 
+                NA)
+  return(ans)
+}
+
+movielens <- movielens %>%
+  mutate(movie_year = my_gsub(pattern = ".*?\\(([0-9]{4})\\)$", replacement = "\\1", x = title))
+
+# Validation set will be 10% of MovieLens data
+set.seed(1)
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+# remove unsed data
+# rm(dl, ratings, movies, test_index, temp, movielens, removed)
+if (!(data_source %in% c(1,2))) { 
+  rm(dl) 
+}
+rm(test_index, temp, removed)
+```
+
+The _edx_ data set is then further splitted into a training set (90% _edx\_train_) and a test set (10% _edx\_test_).  This _edx\_test_ set is used for experimenting with different models by comparing the residual mean squared error (RMSE) of each model that are build in this project.
+
+```{r further_split_edx, message=FALSE, warning=FALSE}
+# split edx into train/test sets - to experiment with different model
+edx_test_ratio <- 0.1
+edx_test_index <- createDataPartition(y = edx$rating, times = 1, 
+                                      p = edx_test_ratio, list = FALSE)
+edx_train <- edx[-edx_test_index,]
+temp_test <- edx[edx_test_index,]
+
+# make sure userId and movieId in edx_test set are also in edx_train set
+edx_test <- temp_test %>% 
+  semi_join(edx_train, by = "movieId") %>%
+  semi_join(edx_train, by = "userId")
+
+# add rows removed from edx_test set back into edx_train set
+edx_removed <- anti_join(temp_test, edx_test)
+edx_train <- rbind(edx_train, edx_removed)
+
+# remove temp data
+rm(temp_test, edx_test_index, edx_removed)
+
+```
+
+Before embarking on model building, we explore the data to see if the data set requires further clean up and whether there is variability in the movie ratings across all movies and also ratings given by each user in the user population.  The next section will discuss this in detail.
+
+### 2 Methods/Analysis
+
+This section describes the process and techniques used for data cleaning, data exploration and visualisation, insights gained, and discusses different modelling approaches.
+
+
+#### 2.1 Data cleaning
+
+The _movielens_ data frame is a combination of users and movie ratings.  A quick look at the _movielens_ data set shows each row presents the movie rating given by a particular user for the movie.
+
+```{r data_quick_look, echo=FALSE}
+head(movielens)
+```
+
+The users in the data set should contain only those who have rated at least 20 movies - as shown in the output below with user rating counts sorted in ascending order.
+
+```{r users_at_least_20_ratings, echo=FALSE}
+# sort ratings of users in ascending order
+sorted_user_rating <- ratings %>% 
+  group_by(userId) %>% 
+  summarise(user_rating_count=n()) %>% 
+  arrange(user_rating_count) 
+head(sorted_user_rating)
+```
+
+Although there are 4 movies that are not rated, they are not included in the data set to be used for building and testing the models.  It is also a small number compared the size of the data set and should not affect the findings.
+
+```{r unrated_movies, echo=FALSE}
+# Movies not rated
+movies_all <- as.numeric(unique(movies$movieId))
+movies_rated <- as.numeric(unique(ratings$movieId))
+movies_unrated <- setdiff(movies_all, movies_rated)
+movies %>% 
+  filter(movieId %in% movies_unrated)
+```
+
+There is no empty or unknown ratings in the data set that is to be used for training, testing and validation.
+
+```{r empty_rating}
+sum(is.na(movielens$rating))
+```
+
+The data set appears to be in good shape and does not require further cleaning for the purpose of this project.
+
+#### 2.2 Data exploration and visualisation
+
+We move on to explore the data set and hope to gain some insights of the data before building the models.
+
+The following histogram shows some movies get rated more than others.  This is likely the case for blockbusters that are watched by many users and independent films that are only watched by a few users.
+
+```{r hist_movie_rating, echo=FALSE, fig.align="center"}
+# 1: some movies get rated more than the rest - see the distribution
+# there are blockbusters watched by millions and independent films watched by a few
+#
+movie_rating_count <- movielens %>% group_by(movieId) %>% summarise(movie_rating_count=n()) 
+movie_rating_count %>% 
+  ggplot(aes(movie_rating_count)) + 
+  geom_histogram(bins=20, color="black", fill="grey", alpha=0.3) + 
+  # labs(title="Histogram: rating counts across movies") + 
+  ggtitle("Histogram: rating counts across movies") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Rating counts (Log10)") +
+  ylab("Number of movies") +
+  scale_x_log10()
+```
+
+The following histogram shows user activity in rating the movies.  Some users rated over a thousand movies; with most users rated in hundreds or less; and some users only rated a few movies.
+
+```{r hist_user_rating, echo=FALSE, fig.align="center"}
+# 2. User activity in rating movies: some users rated over a thousand movies, 
+# with most rated in hundreds or less; and some rated only a few
+user_rate_count <- movielens %>% group_by(userId) %>% summarise(user_rating_count=n())
+user_rate_count %>% 
+  ggplot(aes(user_rating_count)) + 
+  geom_histogram(bins=20, color="black", fill="grey", alpha=0.3) + 
+  ggtitle("Histogram: rating counts of users") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Rating counts (Log10)") +
+  ylab("Number of users") +
+  scale_x_log10()
+```
+
+Each movie appear to have a different average rating.  The plot of average rating for each movie shows  each movie in the data set has a different average rating.
+
+```{r avg_movie_ratings, echo=FALSE, fig.align="center"}
+# 3. each movie has a different average rating (filter by movies that received more then 10 ratings)
+movie_avg_rating <- movielens %>% 
+  group_by(movieId) %>%
+  filter(n()>10) %>%
+  summarise(avg_rating=mean(rating))
+movie_avg_rating <- cbind(movie_num=1:nrow(movie_avg_rating), movie_avg_rating)
+movie_avg_rating %>% 
+  ggplot(aes(x=movie_num,y=avg_rating)) + 
+  geom_point(alpha=0.2, color="#33a02c") +
+  ggtitle("Average rating for each movie") +
+  xlab("Movies in data set") +
+  ylab("Average rating of each movie") + 
+  scale_x_continuous(breaks = NULL) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_line(size = 0.2, linetype = 'solid',
+                                        colour = "grey"), 
+        panel.grid.minor = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"))
+```
+
+The user population also displays different rating behaviours.  The plot below shows different users rate movies differently - some with high average ratings, others with low average ratings and most users somewhere in between.
+
+```{r avg_user_ratings, echo=FALSE, fig.align="center"}
+# 4. each user has a different average rating (filter by users who rated more than 300 movies)
+user_avg_rating <- movielens %>% 
+  group_by(userId) %>% 
+  filter(n()>300) %>%
+  summarise(avg_rating=mean(rating))
+user_avg_rating <- cbind(user_num=1:nrow(user_avg_rating), user_avg_rating)
+user_avg_rating %>% 
+  ggplot(aes(x=user_num,y=avg_rating)) + 
+  geom_point(alpha=0.2, color="#1f78b4") +
+  ggtitle("Average rating by each user") +
+  xlab("Users in data set") +
+  ylab("Average rating given by each user") + 
+  scale_x_continuous(breaks = NULL) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_line(size = 0.2, linetype = 'solid',
+                                        colour = "grey"), 
+        panel.grid.minor = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"))
+```
+
+We also see that the average rating differs across the years in which the movie is released, as shown by the following plot.
+
+```{r avg_rating_year, message=FALSE, warning=FALSE, echo=FALSE, fig.align="center"}
+# 5. each year has a different average rating 
+year_avg_rating <- movielens %>% 
+  group_by(movie_year) %>% 
+  summarise(avg_rating=mean(rating))
+year_avg_rating$movie_year <- as.numeric(year_avg_rating$movie_year)
+year_avg_rating %>% 
+  ggplot(aes(x=movie_year,y=avg_rating)) + 
+  geom_point(alpha=0.9, color="#ff7f00") +
+  ggtitle("Average rating by movie release year") +
+  xlab("Year") +
+  ylab("Average rating for movies released in each year") + 
+  scale_y_continuous(breaks = seq(0, 5, 0.5)) +
+  ylim(3,4.5) +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_line(size = 0.2, linetype = 'solid',
+                                        colour = "grey"), 
+        panel.grid.minor = element_line(size = 0.1, linetype = 'solid',
+                                        colour = "white"))
+```
+
+#### 2.3 Insights gained
+
+The plots in the previous section show that there is variability in ratings across movies; different user rating behaviours in the user population and varying average rating over the years which the movies are released.  These could have effects on the rating of movies.  We will investigate whether these variabilities have any effects on movie rating prediction by introducing these effects to the different models we build in this project.
+
+#### 2.4 Modeling approach
+
+We need to quantify what metrics need to do well as a basis to compare between different models and RMSE (residual means squared error) is chosen for this purpose.
+
+A RMSE function is defined as follows:
+
+```{r rmse_function}
+# define the RMSE function
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+We first build a simple model whereby the same rating is predicted for all movies, regardless of users and movies.  In this case, that is the mean of all ratings in the training set.  We will use the _edx\_train_ and _edx\_test_ data sets for training and test purpose at this stage.
+
+The average rating of all movies across all users is
+```{r mu_hat}
+mu_hat <- mean(edx_train$rating)
+mu_hat
+```
+
+To see how well this model perform, we look at how the prediction model predicts the outcome on the test data set.  That is predicting all ratings of the test data set with this average.
+
+```{r naive_rmse}
+naive_rmse <- RMSE(edx_test$rating, mu_hat)
+naive_rmse
+```
+
+The result of predicting the same average rating for all movies shows a pretty large RMSE (`r naive_rmse`), which does not suggest a very good prediction.
+
+In fact, if we simply predict any other ratings, the RMSE would be even larger as shown below.
+
+```{r rmse_any_rating}
+predictions <- rep(2.5, nrow(edx_test))
+RMSE(edx_test$rating, predictions)
+
+predictions <- rep(2, nrow(edx_test))
+RMSE(edx_test$rating, predictions)
+```
+
+A table is used to store this result and also results for the different models that we will continue to build and discuss later. 
+
+```{r result_table, warning=FALSE, message=FALSE}
+rmse_results <- data_frame(method = "Predicting the average", RMSE = naive_rmse)
+kp <- 5
+rmse_results %>% knitr::kable(padding=kp)
+```
+
+In the previous section where we explore and visualise the data set, we know that each movie has a different average rating.  So, we can augment the first model by adding the average rating of each movie to each movie's rating prediction (with each movie's rating - denoted by _b\_i_ that represents average rating for movie _i_, also known as effects in statistics).
+
+```{r model_1}
+# fit <- lm(rating ~ as.factor(userId), data = movielens)  
+# lm function will take some time
+# we use this instead for each movie i: b_i = y(u,i) - overall mean 
+mu <- mean(edx_train$rating) 
+movie_avgs <- edx_train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+```
+
+The following plot shows the estimates varies substantially.
+
+```{r model_1_est_plot}
+# the estimates varies substantially as shown in this plot
+movie_avgs %>% qplot(b_i, geom ="histogram", bins = 10, data = ., 
+                     color = I("black"))
+```
+
+```{r model_1_predict}
+predicted_ratings <- mu + edx_test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  .$b_i
+
+model_1_rmse <- RMSE(predicted_ratings, edx_test$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie Effect Model",
+                                     RMSE = model_1_rmse ))
+rmse_results %>% knitr::kable(padding=kp)
+```
+
+Comparing the RMSE from the first simple model against the model augmented with movie effects clearly shows that the model with movie effect has a slightly better prediction, supported by a smaller RMSE (`r model_1_rmse`).
+
+We also know that different users display different behaviours in rating the movies. We augment the model again by adding user-specific effects (denoted by _b\_u_ in the formula)
+
+```{r model_2}
+# try out: lm on movie+user effects 
+# lm(rating ~ as.factor(movieId) + as.factor(userId))
+# lm will take some time to run; 
+# we use this instead: b_u = y(u,i) - overall mean - b_i
+user_avgs <- edx_test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+```
+
+The plot below shows the estimates varies substantially.
+
+```{r model_2_est_plot}
+# the estimates varies substantially as shown in this plot 
+# this suggests variability in average rating across different users
+user_avgs %>% qplot(b_u, geom ="histogram", bins = 20, data = ., 
+                    color = I("black"))
+```
+
+```{r model_2_predict}
+predicted_ratings <- edx_test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+model_2_rmse <- RMSE(predicted_ratings, edx_test$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie + User Effects Model",  
+                                     RMSE = model_2_rmse ))
+rmse_results %>% knitr::kable(padding=kp)
+```
+
+We now see the RMSE of the model with movie and user effects dropped even further to `r model_2_rmse`, suggesting improvement in this prediction model.
+
+Findings from data exploration and visualisation suggest that the year the movie is released can have an effect on the movie ratings. We further augment the model to add year effects (denoted by _b\_y_ in the formula).
+
+```{r model_3}
+# try out: lm on movie+user+year effects
+# lm(rating ~ as.factor(movieId) + as.factor(userId) + as.factor(movie_year))
+year_avgs <- edx_test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(movieId) %>%
+  summarize(b_y = mean(rating - mu - b_i - b_u))
+```
+
+The plot below shows the estimates varies substantially.
+
+```{r model_3_est_plot}
+# the estimates varies substantially as shown in this plot
+# this suggests variability in average rating across different 
+# years in which the movie is released
+year_avgs %>% qplot(b_y, geom ="histogram", bins = 20, data = ., 
+                    color = I("black"))
+```
+
+```{r model_3_predict}
+predicted_ratings <- edx_test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(year_avgs, by='movieId') %>%
+  mutate(pred = mu + b_i + b_u + b_y) %>%
+  .$pred
+
+model_3_rmse <- RMSE(predicted_ratings, edx_test$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie + User + Year Effects Mode",  
+                                     RMSE = model_3_rmse ))
+rmse_results %>% knitr::kable(padding=kp)
+```
+
+The RMSE of the model that includes movie, user-specific and year effects (`r model_3_rmse`) is less compared to the previous models - suggesting improvement to the prediction model.
+
+### 3 Results
+
+#### 3.1 Test findings
+
+The above experiment uses training and test data sets splitted from the edx data set (as _edx\_train_ 90% and _edx\_test_ 10%).  The results from training different models with _edx\_train_ data set, and testing with _edx\_test_ data set shows that predicting the just average has a RSME of `r naive_rmse`.  
+
+```{r rsme_results_e, echo=FALSE}
+# store the rsme_results of experimenting with edx_train/edx_test
+rmse_results_e <- rmse_results
+
+rmse_results_e %>% knitr::kable(padding=kp) 
+```
+
+The simple model improved when we introduced the movie effect. This brings the RMSE slightly down to `r model_1_rmse`, as each movie has a different average rating across all movies.
+
+We also observe from the plots that different users give different ratings to movies; and we augmented the model with user effect.  This brings the prediction further down to `r model_2_rmse`, suggesting an even better prediction than the previous two models.
+
+As we continue to augment the model with year effect, it brings the RMSE even lower (`r model_3_rmse`) that suggests closer prediction by this model.
+
+#### 3.2 Validation
+
+After experimenting with the different models on the _edx_ data set, we repeated the predictions and compared the results, this time using all data in _edx_ data set for training and validated all models against the data in the _validation_ data set.
+
+```{r run_codes_on_validation_data, warning=FALSE, message=FALSE, echo=FALSE}
+## 
+## change to train set (edx) and test set (validation)
+
+# try out: naive
+mu_hat <- mean(edx$rating)
+# mu_hat
+
+# see how this model performs by predicting the average; it returns rmse > 1
+naive_rmse <- RMSE(validation$rating, mu_hat)
+# naive_rmse
+
+# create a table to store the results for each model, starting with the first simple model
+rmse_results <- data_frame(method = "Predicting the average", RMSE = naive_rmse)
+# rmse_results %>% knitr::kable(padding=kp)
+
+# in fact, predicting any other numbers shows even a larger rmse
+predictions <- rep(2.5, nrow(validation))
+any_num1 <- RMSE(validation$rating, predictions)
+
+predictions <- rep(2, nrow(validation))
+any_num2 <- RMSE(validation$rating, predictions)
+
+# try out: lm on movie effect
+# fit <- lm(rating ~ as.factor(userId), data = movielens)
+mu <- mean(edx$rating) 
+movie_avgs <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+# the estimates varies substantially as shown in this plot - suggesting variability in average rating across different movies
+# movie_avgs %>% qplot(b_i, geom ="histogram", bins = 20, data = ., color = I("black"))
+
+predicted_ratings <- mu + validation %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  .$b_i
+
+model_1_rmse <- RMSE(predicted_ratings, validation$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie Effect Model",
+                                     RMSE = model_1_rmse ))
+# rmse_results %>% knitr::kable(padding=kp)
+
+# try out: lm on movie+user effects
+# lm(rating ~ as.factor(movieId) + as.factor(userId))
+user_avgs <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+# the estimates varies substantially as shown in this plot - suggesting variability in average rating across different users
+# user_avgs %>% qplot(b_u, geom ="histogram", bins = 20, data = ., color = I("black"))
+
+predicted_ratings <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+model_2_rmse <- RMSE(predicted_ratings, validation$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie + User Effects Model",  
+                                     RMSE = model_2_rmse ))
+# rmse_results %>% knitr::kable(padding=kp)
+
+# try out: lm on movie+user+year effects
+# lm(rating ~ as.factor(movieId) + as.factor(userId) + as.factor(movie_year))
+year_avgs <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(movieId) %>%
+  summarize(b_y = mean(rating - mu - b_i - b_u))
+
+# the estimates varies substantially as shown in this plot - suggesting variability in average rating across different years in which the movie is released
+# year_avgs %>% qplot(b_y, geom ="histogram", bins = 20, data = ., color = I("black"))
+
+predicted_ratings <- validation %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(year_avgs, by='movieId') %>%
+  mutate(pred = mu + b_i + b_u + b_y) %>%
+  .$pred
+
+model_3_rmse <- RMSE(predicted_ratings, validation$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie + User + Year Effects Model",  
+                                     RMSE = model_3_rmse ))
+# rmse_results %>% knitr::kable(padding=kp)
+```
+
+The RMSE of the different models train using _edx_ data set and tested against the _validation_ data set is presented below. 
+
+```{r rmse_validation, echo=FALSE}
+rmse_results %>% knitr::kable(padding=kp) 
+```
+
+Results from both sets of training and test data sets are close (train with _edx\_train_ and test with _edx\_test_; train with _edx_ and test with _validation_).  This suggests that the models are consistent across these data sets.  
+
+The final model that includes movie, user-specific and year effects has RMSE of `r model_3_rmse`.
+
+
+### 4 Conclusion
+
+The findings suggest that augmenting models with additional predictors with significant variability can help in building more accurate model as demonstrated by adding movie effects, user-specific effects and year effects to the simple model that was initially constructed.
