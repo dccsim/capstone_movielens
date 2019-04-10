@@ -1,4 +1,4 @@
-# pet_adoption
+# movielens
 Experimenting with linear regression machine learning models that attempt to predict movie ratings
 
 # Introduction
